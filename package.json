@@ -1,17 +1,18 @@
 {
-  "name": "bundles-signal-sender",
+  "name": "second-bundles-signal-sender",
   "version": "1.0.0",
-  "description": "Railway service that submits Solana token signals to a Bundles.trade agent",
-  "type": "module",
+  "description": "Bundles.trade Agentic Signal Sender",
   "main": "index.js",
+  "private": true,
+  "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "ws": "^8.18.3"
   }
