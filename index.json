@@ -1,0 +1,685 @@
+import "dotenv/config";
+import express from "express";
+import WebSocket from "ws";
+import crypto from "crypto";
+
+const PORT = Number(process.env.PORT || 3000);
+
+const BUNDLES_WS_URL =
+  process.env.BUNDLES_WS_URL || "wss://bundles.trade/ws/agentic";
+
+const BUNDLES_API_KEY = process.env.BUNDLES_API_KEY;
+const BUNDLE_ADDRESS = process.env.BUNDLE_ADDRESS;
+const SEND_SECRET = process.env.SEND_SECRET || "";
+
+const TOKEN_ADDRESSES = parseTokenAddresses(
+  process.env.TOKEN_ADDRESSES || ""
+);
+
+const NOTE =
+  process.env.NOTE || "Candidate submitted from Big Guns Index";
+
+const AUTO_SEND_ON_START =
+  String(process.env.AUTO_SEND_ON_START || "false").toLowerCase() ===
+  "true";
+
+const REQUEST_TIMEOUT_MS = Number(
+  process.env.REQUEST_TIMEOUT_MS || 15000
+);
+
+const MAX_HISTORY_ENTRIES = Math.min(
+  Math.max(Number(process.env.MAX_HISTORY_ENTRIES || 100), 1),
+  1000
+);
+
+/*
+|--------------------------------------------------------------------------
+| Submission history
+|--------------------------------------------------------------------------
+|
+| Railway logs will retain console output according to your Railway plan.
+| This in-memory history is also available through GET /history.
+|
+| In-memory history resets whenever Railway restarts or redeploys.
+|
+*/
+
+const submissionHistory = [];
+
+function addHistoryEntry(entry) {
+  const historyEntry = {
+    id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    ...entry,
+  };
+
+  submissionHistory.unshift(historyEntry);
+
+  if (submissionHistory.length > MAX_HISTORY_ENTRIES) {
+    submissionHistory.length = MAX_HISTORY_ENTRIES;
+  }
+
+  console.log(
+    "SUBMISSION_LOG",
+    JSON.stringify(historyEntry)
+  );
+
+  return historyEntry;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Address parsing and validation
+|--------------------------------------------------------------------------
+*/
+
+function parseTokenAddresses(input) {
+  return [
+    ...new Set(
+      String(input)
+        .split(/[\s,]+/)
+        .map((address) => address.trim())
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function isLikelySolanaAddress(address) {
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address);
+}
+
+function validateConfiguration() {
+  const missingVariables = [];
+
+  if (!BUNDLES_API_KEY) {
+    missingVariables.push("BUNDLES_API_KEY");
+  }
+
+  if (!BUNDLE_ADDRESS) {
+    missingVariables.push("BUNDLE_ADDRESS");
+  }
+
+  if (missingVariables.length > 0) {
+    throw new Error(
+      `Missing required Railway variables: ${missingVariables.join(", ")}`
+    );
+  }
+}
+
+function prepareTokenAddresses(tokenAddresses) {
+  const uniqueAddresses = [
+    ...new Set(
+      tokenAddresses
+        .map((address) => String(address).trim())
+        .filter(Boolean)
+    ),
+  ];
+
+  const validAddresses = uniqueAddresses.filter(
+    isLikelySolanaAddress
+  );
+
+  const invalidAddresses = uniqueAddresses.filter(
+    (address) => !isLikelySolanaAddress(address)
+  );
+
+  if (invalidAddresses.length > 0) {
+    console.warn(
+      "Skipping invalid-looking token addresses:",
+      invalidAddresses
+    );
+  }
+
+  if (validAddresses.length === 0) {
+    throw new Error("No valid Solana token addresses were supplied.");
+  }
+
+  if (validAddresses.length > 20) {
+    throw new Error(
+      "Bundles accepts a maximum of 20 signals per submission."
+    );
+  }
+
+  return validAddresses;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Private endpoint protection
+|--------------------------------------------------------------------------
+*/
+
+function readProvidedSecret(req) {
+  return String(
+    req.query.key ||
+      req.get("x-send-secret") ||
+      ""
+  );
+}
+
+function safeSecretMatch(providedSecret, requiredSecret) {
+  const provided = Buffer.from(String(providedSecret));
+  const required = Buffer.from(String(requiredSecret));
+
+  if (provided.length !== required.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(provided, required);
+}
+
+function requireSendSecret(req, res, next) {
+  if (!SEND_SECRET) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "SEND_SECRET is not configured. Add it in Railway Variables before using send or history endpoints.",
+    });
+  }
+
+  const providedSecret = readProvidedSecret(req);
+
+  if (!safeSecretMatch(providedSecret, SEND_SECRET)) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized.",
+    });
+  }
+
+  next();
+}
+
+/*
+|--------------------------------------------------------------------------
+| Bundles WebSocket submission
+|--------------------------------------------------------------------------
+*/
+
+function submitSignal(tokenAddresses) {
+  validateConfiguration();
+
+  const validAddresses = prepareTokenAddresses(tokenAddresses);
+
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    let payloadSent = false;
+
+    console.log(`Connecting to ${BUNDLES_WS_URL}...`);
+
+    const socket = new WebSocket(BUNDLES_WS_URL);
+
+    const timeout = setTimeout(() => {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close();
+      }
+
+      if (payloadSent) {
+        resolve({
+          success: false,
+          error:
+            "Signal payload was sent, but no acknowledgement was received before timeout.",
+          submittedTokens: validAddresses,
+        });
+      } else {
+        reject(
+          new Error(
+            "Timed out before the signal payload could be sent."
+          )
+        );
+      }
+    }, REQUEST_TIMEOUT_MS);
+
+    function complete(result) {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+      clearTimeout(timeout);
+
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+
+      resolve(result);
+    }
+
+    function fail(error) {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+      clearTimeout(timeout);
+
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close();
+      }
+
+      reject(error);
+    }
+
+    socket.on("open", () => {
+      console.log("Connected to Bundles.trade.");
+
+      const payload = {
+        type: "agentic:signal:submit",
+        bundleAddress: BUNDLE_ADDRESS,
+        apiKey: BUNDLES_API_KEY,
+        signals: validAddresses.map((tokenAddress, index) => ({
+          tokenAddress,
+          note: `${NOTE} - candidate ${index + 1} of ${validAddresses.length}`,
+        })),
+      };
+
+      console.log(
+        `Submitting ${validAddresses.length} candidate signal(s).`
+      );
+
+      /*
+      The API key is deliberately excluded from logs.
+      */
+      console.log({
+        type: payload.type,
+        bundleAddress: payload.bundleAddress,
+        signals: payload.signals,
+      });
+
+      socket.send(JSON.stringify(payload), (error) => {
+        if (error) {
+          fail(error);
+          return;
+        }
+
+        payloadSent = true;
+        console.log("Signal payload sent to Bundles.trade.");
+      });
+    });
+
+    socket.on("message", (data) => {
+      const rawMessage = data.toString();
+
+      let bundlesResponse;
+
+      try {
+        bundlesResponse = JSON.parse(rawMessage);
+      } catch {
+        bundlesResponse = {
+          ok: false,
+          error: "Bundles returned a non-JSON response.",
+          rawResponse: rawMessage,
+        };
+      }
+
+      console.log("Bundles response:", bundlesResponse);
+
+      complete({
+        success: bundlesResponse?.ok === true,
+        submittedTokens: validAddresses,
+        bundlesResponse,
+      });
+    });
+
+    socket.on("error", (error) => {
+      console.error("WebSocket error:", error.message);
+      fail(error);
+    });
+
+    socket.on("close", (code, reasonBuffer) => {
+      const reason = reasonBuffer?.toString() || "";
+
+      console.log(
+        `WebSocket closed. Code: ${code}. Reason: ${reason}`
+      );
+
+      if (!finished && !payloadSent) {
+        fail(
+          new Error(
+            `Connection closed before signal submission. Code ${code}: ${reason}`
+          )
+        );
+      }
+    });
+  });
+}
+
+/*
+|--------------------------------------------------------------------------
+| HTTP application
+|--------------------------------------------------------------------------
+*/
+
+const app = express();
+
+app.disable("x-powered-by");
+app.use(express.json({ limit: "100kb" }));
+
+app.get("/", (req, res) => {
+  res.json({
+    service: "Bundles.trade signal sender",
+    status: "running",
+    submissionType: "agentic:signal:submit",
+    payloadArray: "signals",
+    configuredTokenCount: TOKEN_ADDRESSES.length,
+    maximumSignalsPerSubmission: 20,
+    storedHistoryEntries: submissionHistory.length,
+    maximumHistoryEntries: MAX_HISTORY_ENTRIES,
+    autoSendOnStart: AUTO_SEND_ON_START,
+    sendSecretConfigured: Boolean(SEND_SECRET),
+    endpoints: {
+      health: "GET /health",
+      sendFromBrowser: "GET /send?key=YOUR_SEND_SECRET",
+      sendConfiguredSignals: "POST /send",
+      sendCustomSignals: "POST /send-custom",
+      viewHistory: "GET /history?key=YOUR_SEND_SECRET",
+    },
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "Big Guns Index",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/*
+GET /send allows browser-based submission.
+Example:
+https://your-domain.up.railway.app/send?key=YOUR_SECRET
+*/
+app.get("/send", requireSendSecret, async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    if (TOKEN_ADDRESSES.length === 0) {
+      const result = {
+        success: false,
+        error:
+          "TOKEN_ADDRESSES is empty. Add at least one address in Railway Variables.",
+      };
+
+      addHistoryEntry({
+        requestMethod: "GET",
+        endpoint: "/send",
+        success: false,
+        tokenAddresses: [],
+        error: result.error,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return res.status(400).json(result);
+    }
+
+    const result = await submitSignal(TOKEN_ADDRESSES);
+
+    addHistoryEntry({
+      requestMethod: "GET",
+      endpoint: "/send",
+      success: result.success,
+      tokenAddresses: result.submittedTokens,
+      acceptedCount:
+        result.bundlesResponse?.acceptedCount ?? 0,
+      bundlesResponse: result.bundlesResponse || null,
+      error: result.error || result.bundlesResponse?.error || null,
+      durationMs: Date.now() - startedAt,
+    });
+
+    return res.status(result.success ? 200 : 400).json(result);
+  } catch (error) {
+    console.error("Browser signal submission failed:", error);
+
+    addHistoryEntry({
+      requestMethod: "GET",
+      endpoint: "/send",
+      success: false,
+      tokenAddresses: TOKEN_ADDRESSES,
+      error: error.message,
+      durationMs: Date.now() - startedAt,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/*
+POST /send remains available for curl and API clients.
+Supply the secret through:
+X-Send-Secret: YOUR_SECRET
+
+or through:
+?key=YOUR_SECRET
+*/
+app.post("/send", requireSendSecret, async (req, res) => {
+  const startedAt = Date.now();
+
+  try {
+    if (TOKEN_ADDRESSES.length === 0) {
+      const result = {
+        success: false,
+        error:
+          "TOKEN_ADDRESSES is empty. Add at least one address in Railway Variables.",
+      };
+
+      addHistoryEntry({
+        requestMethod: "POST",
+        endpoint: "/send",
+        success: false,
+        tokenAddresses: [],
+        error: result.error,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return res.status(400).json(result);
+    }
+
+    const result = await submitSignal(TOKEN_ADDRESSES);
+
+    addHistoryEntry({
+      requestMethod: "POST",
+      endpoint: "/send",
+      success: result.success,
+      tokenAddresses: result.submittedTokens,
+      acceptedCount:
+        result.bundlesResponse?.acceptedCount ?? 0,
+      bundlesResponse: result.bundlesResponse || null,
+      error: result.error || result.bundlesResponse?.error || null,
+      durationMs: Date.now() - startedAt,
+    });
+
+    return res.status(result.success ? 200 : 400).json(result);
+  } catch (error) {
+    console.error("Signal submission failed:", error);
+
+    addHistoryEntry({
+      requestMethod: "POST",
+      endpoint: "/send",
+      success: false,
+      tokenAddresses: TOKEN_ADDRESSES,
+      error: error.message,
+      durationMs: Date.now() - startedAt,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post(
+  "/send-custom",
+  requireSendSecret,
+  async (req, res) => {
+    const startedAt = Date.now();
+    let cleanedAddresses = [];
+
+    try {
+      const suppliedAddresses = req.body?.tokenAddresses;
+
+      if (!Array.isArray(suppliedAddresses)) {
+        const result = {
+          success: false,
+          error:
+            "Request body must contain a tokenAddresses array.",
+          example: {
+            tokenAddresses: [
+              "SolanaContractAddressOne",
+              "SolanaContractAddressTwo",
+            ],
+          },
+        };
+
+        addHistoryEntry({
+          requestMethod: "POST",
+          endpoint: "/send-custom",
+          success: false,
+          tokenAddresses: [],
+          error: result.error,
+          durationMs: Date.now() - startedAt,
+        });
+
+        return res.status(400).json(result);
+      }
+
+      cleanedAddresses = parseTokenAddresses(
+        suppliedAddresses.join(",")
+      );
+
+      const result = await submitSignal(cleanedAddresses);
+
+      addHistoryEntry({
+        requestMethod: "POST",
+        endpoint: "/send-custom",
+        success: result.success,
+        tokenAddresses: result.submittedTokens,
+        acceptedCount:
+          result.bundlesResponse?.acceptedCount ?? 0,
+        bundlesResponse: result.bundlesResponse || null,
+        error:
+          result.error ||
+          result.bundlesResponse?.error ||
+          null,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return res.status(result.success ? 200 : 400).json(result);
+    } catch (error) {
+      console.error("Custom signal submission failed:", error);
+
+      addHistoryEntry({
+        requestMethod: "POST",
+        endpoint: "/send-custom",
+        success: false,
+        tokenAddresses: cleanedAddresses,
+        error: error.message,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return res.status(500).json({
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+);
+
+/*
+View the most recent submission history.
+Example:
+https://your-domain.up.railway.app/history?key=YOUR_SECRET
+*/
+app.get("/history", requireSendSecret, (req, res) => {
+  res.json({
+    success: true,
+    count: submissionHistory.length,
+    maximumStored: MAX_HISTORY_ENTRIES,
+    warning:
+      "This in-memory history resets when Railway restarts or redeploys.",
+    history: submissionHistory,
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Start server
+|--------------------------------------------------------------------------
+*/
+
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}.`);
+  console.log(
+    `Configured signal token count: ${TOKEN_ADDRESSES.length}.`
+  );
+  console.log(
+    "WebSocket submission type: agentic:signal:submit"
+  );
+  console.log("Payload array field: signals");
+  console.log(
+    `Send secret configured: ${Boolean(SEND_SECRET)}`
+  );
+  console.log(
+    `Maximum in-memory history entries: ${MAX_HISTORY_ENTRIES}`
+  );
+
+  if (!AUTO_SEND_ON_START) {
+    return;
+  }
+
+  if (TOKEN_ADDRESSES.length === 0) {
+    console.error(
+      "AUTO_SEND_ON_START is true, but TOKEN_ADDRESSES is empty."
+    );
+    return;
+  }
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    const startedAt = Date.now();
+    const result = await submitSignal(TOKEN_ADDRESSES);
+
+    addHistoryEntry({
+      requestMethod: "AUTOMATIC",
+      endpoint: "startup",
+      success: result.success,
+      tokenAddresses: result.submittedTokens,
+      acceptedCount:
+        result.bundlesResponse?.acceptedCount ?? 0,
+      bundlesResponse: result.bundlesResponse || null,
+      error: result.error || result.bundlesResponse?.error || null,
+      durationMs: Date.now() - startedAt,
+    });
+
+    console.log("Automatic signal submission complete:", result);
+  } catch (error) {
+    console.error(
+      "Automatic signal submission failed:",
+      error.message
+    );
+
+    addHistoryEntry({
+      requestMethod: "AUTOMATIC",
+      endpoint: "startup",
+      success: false,
+      tokenAddresses: TOKEN_ADDRESSES,
+      error: error.message,
+    });
+  }
+});
