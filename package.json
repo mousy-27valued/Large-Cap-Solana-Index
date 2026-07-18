@@ -1,7 +1,6 @@
 {
   "name": "second-bundles-signal-sender",
   "version": "1.0.0",
-  "description": "Sends configured Solana token signals to a Bundles.trade agent through WebSocket.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -11,7 +10,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "ws": "^8.18.0"
   }
